@@ -6,6 +6,7 @@ import com.github.xingjianluo.marketdataingestjava.checkpoint.CheckpointManager;
 import com.github.xingjianluo.marketdataingestjava.codec.EventCodec;
 import com.github.xingjianluo.marketdataingestjava.dedupe.DedupTable;
 import com.github.xingjianluo.marketdataingestjava.pipeline.IngestPipeline;
+import com.github.xingjianluo.marketdataingestjava.replay.ReplayService;
 import com.github.xingjianluo.marketdataingestjava.state.FileSnapshotRepository;
 import com.github.xingjianluo.marketdataingestjava.state.SnapshotRepository;
 import com.github.xingjianluo.marketdataingestjava.window.WatermarkManager;
@@ -59,5 +60,10 @@ public class IngestConfig {
                                          SnapshotRepository snapshotRepository) {
         return new IngestPipeline(codec, dedupTable, watermarkManager, checkpointManager,
                 aggregationTable, snapshotRepository);
+    }
+
+    @Bean
+    public ReplayService replayService(IngestPipeline ingestPipeline) {
+        return new ReplayService(ingestPipeline);
     }
 }

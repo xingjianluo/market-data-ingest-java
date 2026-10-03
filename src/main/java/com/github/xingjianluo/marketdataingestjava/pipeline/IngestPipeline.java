@@ -5,10 +5,13 @@ import com.github.xingjianluo.marketdataingestjava.checkpoint.CheckpointManager;
 import com.github.xingjianluo.marketdataingestjava.codec.EventCodec;
 import com.github.xingjianluo.marketdataingestjava.codec.InvalidEventException;
 import com.github.xingjianluo.marketdataingestjava.dedupe.DedupTable;
+import com.github.xingjianluo.marketdataingestjava.dedupe.EventKey;
 import com.github.xingjianluo.marketdataingestjava.model.AggregateView;
 import com.github.xingjianluo.marketdataingestjava.model.IngestResult;
 import com.github.xingjianluo.marketdataingestjava.model.IngestStatus;
 import com.github.xingjianluo.marketdataingestjava.model.MarketEvent;
+import com.github.xingjianluo.marketdataingestjava.replay.EventJournal;
+import com.github.xingjianluo.marketdataingestjava.replay.JournaledEvent;
 import com.github.xingjianluo.marketdataingestjava.state.PipelineState;
 import com.github.xingjianluo.marketdataingestjava.state.SnapshotRepository;
 import com.github.xingjianluo.marketdataingestjava.window.WatermarkManager;
@@ -41,6 +44,7 @@ public class IngestPipeline {
     private final CheckpointManager checkpointManager;
     private final AggregationTable aggregationTable;
     private final SnapshotRepository snapshotRepository;
+    private final EventJournal journal;
     private final Object lock = new Object();
 
     public IngestPipeline(EventCodec codec,
@@ -49,12 +53,52 @@ public class IngestPipeline {
                           CheckpointManager checkpointManager,
                           AggregationTable aggregationTable,
                           SnapshotRepository snapshotRepository) {
+        this(codec, dedupTable, watermarkManager, checkpointManager, aggregationTable,
+                snapshotRepository, new EventJournal());
+    }
+
+    public IngestPipeline(EventCodec codec,
+                          DedupTable dedupTable,
+                          WatermarkManager watermarkManager,
+                          CheckpointManager checkpointManager,
+                          AggregationTable aggregationTable,
+                          SnapshotRepository snapshotRepository,
+                          EventJournal journal) {
         this.codec = codec;
         this.dedupTable = dedupTable;
         this.watermarkManager = watermarkManager;
         this.checkpointManager = checkpointManager;
         this.aggregationTable = aggregationTable;
         this.snapshotRepository = snapshotRepository;
+        this.journal = journal;
+    }
+
+    /** 构造一个配置与本管道完全相同、状态干净空白的新管道（整体重放用）。 */
+    public IngestPipeline freshScratchPipeline() {
+        return new IngestPipeline(
+                codec,
+                new DedupTable(),
+                new WatermarkManager(watermarkManager.allowedLatenessMs()),
+                new CheckpointManager(),
+                new AggregationTable(aggregationTable.bucketSizeMs()),
+                new com.github.xingjianluo.marketdataingestjava.replay.NoopSnapshotRepository(),
+                new EventJournal());
+    }
+
+    public EventCodec codec() {
+        return codec;
+    }
+
+    public long allowedLatenessMs() {
+        return watermarkManager.allowedLatenessMs();
+    }
+
+    public long bucketSizeMs() {
+        return aggregationTable.bucketSizeMs();
+    }
+
+    public EventJournal journal() {
+        return journal;
     }
 
     /** 摄取单条原始 JSON 事件。 */
@@ -72,17 +116,37 @@ public class IngestPipeline {
 
     private IngestResult doIngest(String rawJson, Map<String, Long> expectedOffsets) {
         // 1) 解析在锁外完成（纯函数）；非法事件不触碰任何状态。
-        final MarketEvent event;
+        MarketEvent parsedEvent = null;
+        InvalidEventException parseError = null;
         try {
-            event = codec.decode(rawJson);
+            parsedEvent = codec.decode(rawJson);
         } catch (InvalidEventException ex) {
             log.warn("[判定] INVALID eventId={} reason='{}' raw={}",
                     ex.getRawEventId(), ex.getMessage(), abbreviate(rawJson));
-            return new IngestResult(IngestStatus.REJECTED_INVALID, ex.getRawEventId(),
-                    ex.getMessage(), Long.MIN_VALUE, CheckpointManager.NO_OFFSET);
+            parseError = ex;
         }
+        final MarketEvent event = parsedEvent;
 
+        // 全部结论（含 INVALID）在同一临界区登记事件日志，保证接收顺序与日志顺序一致。
         synchronized (lock) {
+            IngestResult result = (parseError != null)
+                    ? new IngestResult(IngestStatus.REJECTED_INVALID, parseError.getRawEventId(),
+                            parseError.getMessage(), Long.MIN_VALUE, CheckpointManager.NO_OFFSET)
+                    : classify(event, expectedOffsets);
+            journal.append(new JournaledEvent(
+                    journal.nextOrdinal(),
+                    event == null ? null : event.source(),
+                    result.eventId(),
+                    rawJson,
+                    Map.copyOf(expectedOffsets),
+                    result.status(),
+                    result.reason()));
+            return result;
+        }
+    }
+
+    /** 在持有锁的前提下完成 2~6 步判定，返回互斥结论之一。 */
+    private IngestResult classify(MarketEvent event, Map<String, Long> expectedOffsets) {
             long committed = checkpointManager.committedOffsetOf(event.source());
             long watermark = watermarkManager.watermarkOf(event.source());
 
@@ -100,9 +164,13 @@ public class IngestPipeline {
                         event.eventId(), reason, watermark, committed);
             }
 
-            // 3) 重复（同一事件重发/重放天然幂等，先于位点回退判定）
-            if (dedupTable.isDuplicate(event.eventId())) {
-                String reason = "duplicate eventId already aggregated: " + event.eventId();
+            // 3) 重复：同一 (source, eventId) 重发/重放天然幂等，先于位点回退判定。
+            //    跨来源相同 eventId 是独立事件，不在此命中。
+            EventKey dedupKey = EventKey.of(event);
+            if (dedupTable.isDuplicate(dedupKey)) {
+                String reason = "duplicate (source,eventId) already aggregated: "
+                        + event.source() + "/" + event.eventId()
+                        + "（该来源此前已收过同一事件）";
                 log.info("[判定] DUPLICATE eventId={} source={} seq={} (不计入)",
                         event.eventId(), event.source(), event.sequence());
                 return new IngestResult(IngestStatus.DUPLICATE,
@@ -134,7 +202,7 @@ public class IngestPipeline {
             }
 
             // 6) 接受：登记 -> 聚合 -> 水位 -> 位点（同一临界区，要么全做要么全不做）
-            dedupTable.markSeen(event.eventId());
+            dedupTable.markSeen(dedupKey);
             aggregationTable.apply(event);
             long newWatermark = watermarkManager.advance(event.source(), event.eventTime());
             checkpointManager.commit(event.source(), event.sequence());
@@ -145,7 +213,6 @@ public class IngestPipeline {
                     event.venue(), newWatermark, event.sequence());
             return new IngestResult(IngestStatus.ACCEPTED, event.eventId(),
                     "aggregated into bucket", newWatermark, event.sequence());
-        }
     }
 
     /** 原子持久化当前全量状态（先在锁内取一致快照，IO 在锁外执行）。 */
@@ -156,14 +223,14 @@ public class IngestPipeline {
                     System.currentTimeMillis(),
                     watermarkManager.allowedLatenessMs(),
                     aggregationTable.bucketSizeMs(),
-                    dedupTable.snapshotIds(),
+                    dedupTable.snapshotKeys(),
                     watermarkManager.snapshotWatermarks(),
                     checkpointManager.snapshotOffsets(),
                     aggregationTable.allViews());
         }
         snapshotRepository.save(state);
-        log.info("[快照] 已持久化: seenIds={} sources={} buckets={} savedAt={}",
-                state.seenEventIds().size(), state.committedOffsets().size(),
+        log.info("[快照] 已持久化: seenKeys={} sources={} buckets={} savedAt={}",
+                state.seenEventKeys().size(), state.committedOffsets().size(),
                 state.buckets().size(), state.savedAtMillis());
     }
 
@@ -182,12 +249,12 @@ public class IngestPipeline {
                         state.allowedLatenessMs(), state.bucketSizeMs(),
                         watermarkManager.allowedLatenessMs(), aggregationTable.bucketSizeMs()));
             }
-            dedupTable.restore(state.seenEventIds());
+            dedupTable.restore(state.seenEventKeys());
             watermarkManager.restore(state.watermarks());
             checkpointManager.restore(state.committedOffsets());
             aggregationTable.restoreBuckets(state.buckets());
-            log.info("[恢复] 已加载快照: seenIds={} watermarks={} offsets={} buckets={} savedAt={}",
-                    state.seenEventIds().size(), state.watermarks(),
+            log.info("[恢复] 已加载快照: seenKeys={} watermarks={} offsets={} buckets={} savedAt={}",
+                    state.seenEventKeys().size(), state.watermarks(),
                     state.committedOffsets(), state.buckets().size(), state.savedAtMillis());
         }
     }

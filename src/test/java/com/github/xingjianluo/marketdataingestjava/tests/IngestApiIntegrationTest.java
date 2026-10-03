@@ -94,4 +94,38 @@ class IngestApiIntegrationTest {
                 "恢复前后聚合必须一致");
         log.info("快照-恢复后端到端聚合一致");
     }
+
+    @Test
+    void replayFromScratchEndpointVerifiesAndRefusesNonCleanOffset() throws Exception {
+        long t = 240_000L;
+        // 两个来源同号同刻（多源幂等口径端到端）
+        mockMvc.perform(post("/ingest/events").contentType("application/json")
+                .content(mapper.writeValueAsString(Map.of("events", List.of(
+                        TestSupport.event("1", "ex-A", "BBB", "TRADE", t, 0, "100", 1),
+                        TestSupport.event("1", "ex-B", "BBB", "TRADE", t, 0, "102", 1))))))
+                .andExpect(status().isOk());
+
+        // 干净整体重放：与同一 Spring 上下文中此前摄入的全部历史逐条一致
+        // （首个用例已摄入 6 条，本用例再摄入 2 条，共 8 条）。
+        String okResp = mockMvc.perform(post("/ingest/replay")
+                        .contentType("application/json").content("{}"))
+                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
+        JsonNode ok = mapper.readTree(okResp);
+        log.info("HTTP 重放核对: {}", okResp);
+        org.junit.jupiter.api.Assertions.assertEquals(8, ok.get("totalReplayed").asInt());
+        org.junit.jupiter.api.Assertions.assertEquals(8, ok.get("matched").asInt());
+        org.junit.jupiter.api.Assertions.assertEquals(0, ok.get("mismatched").asInt());
+        org.junit.jupiter.api.Assertions.assertTrue(ok.get("aggregatesMatch").asBoolean());
+
+        // 给非 -1 的续处理起始位置 -> 400 明确拒绝
+        mockMvc.perform(post("/ingest/replay").contentType("application/json")
+                        .content(mapper.writeValueAsString(
+                                Map.of("startOffsets", Map.of("ex-A", 0L)))))
+                .andExpect(status().isBadRequest());
+        mockMvc.perform(post("/ingest/replay").contentType("application/json")
+                        .content(mapper.writeValueAsString(
+                                Map.of("startOffsets", Map.of("ex-A", 9L)))))
+                .andExpect(status().isBadRequest());
+        log.info("HTTP 重放对更靠前/更靠后的起始位置均 400 拒绝");
+    }
 }

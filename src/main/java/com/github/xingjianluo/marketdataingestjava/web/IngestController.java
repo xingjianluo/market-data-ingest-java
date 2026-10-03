@@ -5,6 +5,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.xingjianluo.marketdataingestjava.model.AggregateView;
 import com.github.xingjianluo.marketdataingestjava.model.IngestResult;
 import com.github.xingjianluo.marketdataingestjava.pipeline.IngestPipeline;
+import com.github.xingjianluo.marketdataingestjava.replay.ReplayRefusedException;
+import com.github.xingjianluo.marketdataingestjava.replay.ReplayReport;
+import com.github.xingjianluo.marketdataingestjava.replay.ReplayService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -12,6 +15,8 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.server.ResponseStatusException;
+import org.springframework.http.HttpStatus;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -29,10 +34,13 @@ public class IngestController {
 
     private final IngestPipeline pipeline;
     private final ObjectMapper objectMapper;
+    private final ReplayService replayService;
 
-    public IngestController(IngestPipeline pipeline, ObjectMapper objectMapper) {
+    public IngestController(IngestPipeline pipeline, ObjectMapper objectMapper,
+                            ReplayService replayService) {
         this.pipeline = pipeline;
         this.objectMapper = objectMapper;
+        this.replayService = replayService;
     }
 
     /** 接收一批原始事件（多源、可并发调用）。 */
@@ -75,6 +83,26 @@ public class IngestController {
     public String restore() {
         pipeline.restore();
         return "ok";
+    }
+
+    /**
+     * 从干净空白状态把日志中的原始事件整体重放一遍并逐条核对结论。
+     * 可选 body：{"startOffsets": {"src": -1}}；干净状态只接受 -1，否则 400 明确拒绝。
+     */
+    @PostMapping("/replay")
+    public ReplayReport replay(@org.springframework.web.bind.annotation.RequestBody(required = false)
+                               ReplayRequest request) {
+        try {
+            ReplayReport report = replayService.replayFromScratch(
+                    request == null ? Map.of() : request.getStartOffsets());
+            log.info("[入口] 整体重放核对完成 replayed={} matched={} mismatched={} aggregatesMatch={}",
+                    report.totalReplayed(), report.matched(), report.mismatched(),
+                    report.aggregatesMatch());
+            return report;
+        } catch (ReplayRefusedException ex) {
+            log.warn("[入口] 整体重放被拒绝: {}", ex.getMessage());
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, ex.getMessage(), ex);
+        }
     }
 
     private String peekSource(String raw) {
