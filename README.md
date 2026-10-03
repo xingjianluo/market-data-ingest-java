@@ -14,7 +14,7 @@
 # 编译
 mvn -o compile
 
-# 全部测试（离线可跑，16 个用例覆盖并发重复、乱序迟到、重放恢复）
+# 全部测试（离线可跑，26 个用例覆盖多源幂等、并发重复、乱序迟到、极端并列、重放恢复与整体重放核对）
 mvn -o test
 
 # 启动本地 HTTP 服务（默认 8080）
@@ -107,9 +107,9 @@ mvn spring-boot:run
 1. **结构解析** —— 非法 → `REJECTED_INVALID`（在锁外完成，纯函数）。
 2. **重放位点对齐** —— 断点续处理时，调用方给出的期望位点必须等于该源已提交位点；
    偏小（回退）或偏大（跳跃会漏计）→ `REJECTED_OFFSET_REGRESSION`。
-3. **去重** —— `eventId` 已计入 → `DUPLICATE`，天然幂等。
-   同一事件重放携带相同位点时首先命中去重，而不是误判回退。
-4. **位点回退** —— 新 `eventId` 却满足 `sequence <= committedOffset`
+3. **去重** —— 幂等键为 `(source, eventId)`：同一来源重发同一 `eventId`
+   → `DUPLICATE`，天然幂等。同一事件重放携带相同位点时首先命中去重，而不是误判回退。
+4. **位点回退** —— 新事件却满足 `sequence <= committedOffset`
    → `REJECTED_OFFSET_REGRESSION`，绝不从旧位点继续累计。
 5. **迟到判定** —— 每源维护水位 `watermark = 已接受事件的最大 eventTime`，
    当 `eventTime < watermark - allowedLatenessMs` 时 → `REJECTED_LATE`。
@@ -120,26 +120,78 @@ mvn spring-boot:run
 > `REJECTED_LATE` / `REJECTED_OFFSET_REGRESSION`，调用方与日志均可直接区分。
 > 重复、非法、迟到、回退的事件都**不推进水位、不提交位点、不计入聚合**。
 
-### 4.1 乱序并入（顺序无关的聚合）
+### 4.1 多来源独立编号的幂等口径
+
+各来源**各自独立编号**：不同来源会从自己的 1 号（或 0 号）开始派发 `eventId`，
+因此“不同来源、相同 `eventId`、甚至相同业务时间”的事件会经常出现。口径：
+
+- **跨源同号 = 独立业务**：`(source, eventId)` 不同即为不同事件，有几条计几条，
+  互不去重。位点（`sequence`）与水位也按来源各自独立推进，互不干扰。
+- **同源重发 = 重复**：同一来源再次投递同一 `eventId`，判 `DUPLICATE`，只算一次。
+- **结论可一眼区分**：
+  - 跨源独立事件的 `ACCEPTED.reason` 会显式标注
+    `independent event: eventId='...' also seen from other sources [...]`；
+  - 同源重发的 `DUPLICATE.reason` 会指明
+    `already aggregated from source='...'`。
+  日志中分别以 `[跨源独立事件]` / `(同源重发，不计入)` 标注，不会糊在一起。
+
+### 4.2 乱序并入（顺序无关的聚合）
 
 - 桶起点：`floor(eventTime / bucketSizeMs) * bucketSizeMs`，固定时间边界。
-- `open` = 桶内 `(eventTime, eventId)` 二元组最小者的价格；
-  `close` = 最大者的价格（时间相同用 `eventId` 字典序兜底），与到达顺序无关。
+- `open`/`close` 由**确定性全序 `(eventTime, source, eventId)`** 决定：
+  先比业务时间；并列时比 `source` 字典序；再并列比 `eventId` 字典序。
+  全序最小者的价格为 `open`，最大者的价格为 `close`。
+- **极端并列也可解释**：多来源同时刻、同 `eventId` 撞车时，取舍不取决于谁先投递、
+  哪个线程先抢到锁，而是固定的字典序规则；`AggregateView` 回显
+  `openEventSource`/`openEventId` 与 `closeEventSource`/`closeEventId`，
+  判定理由（为什么这条排在前面）可以直接从结果中读出来。
 - `high`/`low` 取价格极值；`count`、`totalQuantity`、分 venue 数量为可加量。
-- 因而乱序事件在窗口内并入、重放重建、快照恢复，都收敛到**逐字段相同**的结果。
+- 因而乱序事件在窗口内并入、多源并发、重放重建、快照恢复，
+  都收敛到**逐字段相同**的结果。
 
 ---
 
 ## 5. 中断恢复与重放
 
-- `POST /ingest/snapshot`：在锁内采集一致状态（去重键集合、各源水位、各源提交位点、
-  全部聚合桶），锁外通过“临时文件 + 原子移动”写入本地 JSON，避免半写文件。
+- `POST /ingest/snapshot`：在锁内采集一致状态（去重表 `eventId -> 已计入来源集合`、
+  各源水位、各源提交位点、全部聚合桶），锁外通过“临时文件 + 原子移动”写入本地 JSON，
+  避免半写文件。
 - `POST /ingest/restore`：从本地文件重建全部内存状态（无文件则空启动）；
   若快照的窗口/桶大小与当前配置不一致，明确报错拒绝恢复，避免语义错位。
 - **重放不重不漏**：恢复后从“已提交位点的下一条”继续；
   已提交事件若被再次投递，命中 `DUPLICATE` 幂等忽略。
 - **回退必须被拒绝**：从比已提交位点更旧的位置重放 → `REJECTED_OFFSET_REGRESSION`，
   而不是从中间继续。
+
+---
+
+## 5.1 整体重放核对（ReplayVerifier）
+
+链路在处理每条报文时，会把**完整输入（原始 JSON + 续处理期望位点）与首次结论**
+按实际处理顺序写入摄取流水账（`IngestPipeline.journal()`，含被拒绝的报文）。
+基于流水账可以做整体重放核对：
+
+```java
+ReplayReport report = ReplayVerifier.forPipeline(pipeline).verify(pipeline.journal());
+// report.totalReplayed()  一共重放多少条
+// report.matched()        多少条结论一致
+// report.mismatched()     多少条结论不一致
+// report.mismatches()     不一致明细：哪一条（流水账序号+eventId）、期望什么、实际什么
+```
+
+核对语义与约束：
+
+- **干净起点**：每次核对都新建一整套管道组件（去重表/水位/位点/聚合/内存快照仓库），
+  不复用、不读取当前内存状态——若首条事件重放后被判 `DUPLICATE`，
+  说明状态发生了泄漏，核对会立刻以不一致暴露出来。
+- **相同输入、相同顺序**：重放顺序 = 流水账顺序 = 首次处理的实际串行顺序；
+  续处理投递会带着当时的期望位点走 `resumeIngest`，位点对齐判定同样被复现。
+  全部判定都是该输入序列的确定性函数，因此健康链路的报告必然 `matched == total`。
+- **逐字段比对**：`status` + `reason` + 判定时水位 + 判定时已提交位点，
+  任一字段漂移都计为不一致并给出明细。
+- **续处理位置强校验**：核对之外，`resumeIngest` 的期望位点比已提交位点
+  靠前（回退）或靠后（跳跃）都会被 `REJECTED_OFFSET_REGRESSION` 明确拒绝，
+  不会从中间悄悄接上去；这些拒绝结论本身也会入账、可被重放复现。
 
 ---
 
@@ -170,17 +222,22 @@ curl -s -XPOST localhost:8080/ingest/snapshot
 
 ## 7. 验证方法（测试一览）
 
-`mvn -o test`，共 16 个用例。测试日志会打印关键事件、处理位点（`committed`/`watermark`）
-与判定依据（`[判定] ACCEPTED/DUPLICATE/LATE/...`、`[快照]`、`[恢复]`）。
+`mvn -o test`，共 26 个用例。测试日志会打印关键事件、处理位点（`committed`/`watermark`）
+与判定依据（`[判定] ACCEPTED/DUPLICATE/LATE/...`、`[跨源独立事件]`、`[快照]`、`[恢复]`、
+`[重放核对]`），每个测试类对应一个业务场景，surefire 汇总可见各类用例数与通过情况。
 
-| 测试类 | 覆盖点 |
-| --- | --- |
-| `ClassificationTest` | 重复、窗口内乱序并入、窗口边界、超期迟到、缺字段/类型错误、位点回退五类结论可区分 |
-| `SchemaEvolutionTest` | v1 稳定缺省、v1/v2 同桶、币种分桶、新字段类型错误不静默、缺省常量稳定 |
-| `OrderIndependenceTest` | 多种到达排列（含乱序）产生逐字段一致的 OHLC，open/close 由时间+id 决定 |
-| `ConcurrencyTest` | 8 线程 × 4 重复投递 200 条事件：每 eventId 恰好计入一次；两次并发运行结果完全一致 |
-| `RecoveryReplayTest` | 快照→重建→继续处理不重不漏；旧位点回退拒绝、跳跃拒绝；已提交事件重放幂等 |
-| `IngestApiIntegrationTest` | HTTP 端到端：批量分类、聚合查询、快照落本地文件、恢复后一致 |
+| 测试类 | 用例数 | 覆盖点 |
+| --- | --- | --- |
+| `ClassificationTest` | 4 | 重复、窗口内乱序并入、窗口边界、超期迟到、缺字段/类型错误、位点回退五类结论可区分 |
+| `MultiSourceIdempotencyTest` | 3 | 多源同号（含同时刻）各自独立计入、同源重发判重且两类结论可区分、位点按源独立、并发重复投递下每个 (source,eventId) 恰好计入一次 |
+| `ExtremeTieOrderIndependenceTest` | 3 | 同时刻+同号跨源并列下 open/close 按 (eventTime,source,eventId) 全序取舍且理由可解释；20 次随机打乱逐字段一致；4 源并发抢投 10 轮与串行一致 |
+| `ReplayVerificationTest` | 4 | 干净状态整体重放逐条比对（总数/一致/不一致统计）、干净起点不继承内存状态、篡改结论后核对器给出明细、续处理位点靠前/靠后均拒绝且拒绝结论可重放复现 |
+| `SchemaEvolutionTest` | 4 | v1 稳定缺省、v1/v2 同桶、币种分桶、新字段类型错误不静默、缺省常量稳定 |
+| `OrderIndependenceTest` | 1 | 多种到达排列（含乱序）产生逐字段一致的 OHLC |
+| `ConcurrencyTest` | 2 | 8 线程重复投递每 eventId 恰好计入一次；两次并发运行结果完全一致 |
+| `RecoveryReplayTest` | 3 | 快照→重建→继续处理不重不漏；旧位点重放拒绝；无快照空启动 |
+| `IngestApiIntegrationTest` | 1 | HTTP 端到端：批量分类、聚合查询、快照落本地文件、恢复后一致 |
+| `ApplicationTests` | 1 | Spring 上下文装配 |
 
 并发模型说明：**多源可并发**（每源独立水位/位点/锁内串行判定），
 **同一来源内部要求按 sequence 顺序投递**（对同一源并发投递乱序位点会被位点规则拒绝，
@@ -193,12 +250,15 @@ curl -s -XPOST localhost:8080/ingest/snapshot
 ```
 model/        MarketEvent / IngestResult / IngestStatus / AggregateView / EventType
 codec/        EventCodec（版本兼容解析）、InvalidEventException
-dedupe/       DedupTable（eventId 幂等去重）
+dedupe/       DedupTable（(source, eventId) 幂等去重，跨源同号独立计入）
 window/       WatermarkManager（每源水位 + 迟到窗口）
 checkpoint/   CheckpointManager（每源提交位点 + 回退判定）
-aggregate/    BucketAggregate / AggregationTable（顺序无关 OHLC）
+aggregate/    BucketAggregate / AggregationTable（(eventTime,source,eventId) 全序 OHLC）
 state/        PipelineState / SnapshotRepository / FileSnapshotRepository（本地原子快照）
-pipeline/     IngestPipeline（判定顺序、并发控制、快照/恢复、重放）
+              / InMemorySnapshotRepository（重放核对的干净起点）
+replay/       RecordedIngestion（摄取流水账）/ ReplayVerifier（干净状态整体重放核对）
+              / ReplayReport / ReplayMismatch（统计与不一致明细）
+pipeline/     IngestPipeline（判定顺序、并发控制、流水账、快照/恢复、重放）
 web/          IngestController / EventRequest（本地 HTTP 入口）
 config/       IngestProperties / IngestConfig（装配与参数）
 ```
