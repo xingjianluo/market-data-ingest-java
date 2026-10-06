@@ -14,6 +14,11 @@ import org.slf4j.LoggerFactory;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -148,5 +153,68 @@ class ReplayVerificationTest extends PipelineTest {
         log.info("含位点拒绝的流水重放: {}", report.summary());
         assertTrue(report.allMatched());
         assertEquals(6, report.totalReplayed());
+    }
+
+    @Test
+    @DisplayName("并发发起核对：结果逐份一致，且核对不污染链路状态、可反复核对")
+    void concurrentVerificationsAreConsistentAndNonPolluting() throws Exception {
+        var p = runMixedBatch();
+        // 记录核对前的链路状态
+        long committedBefore = p.committedOffset("src-A");
+        long watermarkBefore = p.watermark("src-A");
+        var aggregatesBefore = p.aggregates();
+        int journalSizeBefore = p.journal().size();
+
+        // 8 个线程同时发起整体重放核对（同一道起跑线，尽量真并发）
+        int threads = 8;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        CountDownLatch ready = new CountDownLatch(threads);
+        CountDownLatch go = new CountDownLatch(1);
+        List<Future<ReplayReport>> futures = new ArrayList<>();
+        for (int i = 0; i < threads; i++) {
+            Callable<ReplayReport> task = () -> {
+                ready.countDown();
+                go.await();
+                return ReplayVerifier.forPipeline(p).verify(p.journal());
+            };
+            futures.add(pool.submit(task));
+        }
+        ready.await();
+        go.countDown();
+
+        List<ReplayReport> reports = new ArrayList<>();
+        for (Future<ReplayReport> f : futures) {
+            reports.add(f.get());
+        }
+        pool.shutdown();
+
+        // 每份报告必须逐字段一致：总数/一致/不一致/明细全同
+        ReplayReport first = reports.get(0);
+        log.info("并发核对首份报告: {}", first.summary());
+        assertEquals(8, first.totalReplayed());
+        assertEquals(8, first.matched());
+        assertEquals(0, first.mismatched());
+        for (int i = 1; i < reports.size(); i++) {
+            ReplayReport r = reports.get(i);
+            assertEquals(first.totalReplayed(), r.totalReplayed(), "第 " + i + " 份报告总数漂移");
+            assertEquals(first.matched(), r.matched(), "第 " + i + " 份报告一致数漂移");
+            assertEquals(first.mismatched(), r.mismatched(), "第 " + i + " 份报告不一致数漂移");
+            assertEquals(first.mismatches(), r.mismatches(), "第 " + i + " 份报告明细漂移");
+        }
+
+        // 核对不得反过来影响链路：位点/水位/聚合/流水账全部原样
+        assertEquals(committedBefore, p.committedOffset("src-A"), "核对不得推进位点");
+        assertEquals(watermarkBefore, p.watermark("src-A"), "核对不得推进水位");
+        assertEquals(aggregatesBefore, p.aggregates(), "核对不得改动聚合");
+        assertEquals(journalSizeBefore, p.journal().size(), "核对不得写入流水账");
+
+        // 核对之后链路照常处理，且再次核对结果仍然一致（可反复核对）
+        IngestResult after = p.ingest(TestSupport.event("e4", "src-A", "AAA", "TRADE",
+                T + 4000, 3, "106", 10));
+        assertEquals(IngestStatus.ACCEPTED, after.status());
+        ReplayReport again = ReplayVerifier.forPipeline(p).verify(p.journal());
+        log.info("核对后继续处理再核对: {}", again.summary());
+        assertEquals(9, again.totalReplayed());
+        assertTrue(again.allMatched());
     }
 }

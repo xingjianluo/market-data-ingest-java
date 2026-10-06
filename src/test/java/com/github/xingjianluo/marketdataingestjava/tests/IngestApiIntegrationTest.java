@@ -93,5 +93,22 @@ class IngestApiIntegrationTest {
         assertEquals(mapper.readTree(before), mapper.readTree(after),
                 "恢复前后聚合必须一致");
         log.info("快照-恢复后端到端聚合一致");
+
+        // 运行中的链路上直接发起整体重放核对：统计全一致，且核对后聚合不变
+        String verifyResp = mockMvc.perform(post("/ingest/replay-verify"))
+                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
+        JsonNode report = mapper.readTree(verifyResp);
+        log.info("[重放核对] HTTP 报告: total={} matched={} mismatched={}",
+                report.get("totalReplayed").asLong(), report.get("matched").asLong(),
+                report.get("mismatched").asLong());
+        assertEquals(6, report.get("totalReplayed").asLong(), "6 条历史事件全部入账重放");
+        assertEquals(6, report.get("matched").asLong());
+        assertEquals(0, report.get("mismatched").asLong());
+        assertEquals(0, report.get("mismatches").size());
+        String afterVerify = mockMvc.perform(get("/ingest/aggregates"))
+                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
+        assertEquals(mapper.readTree(after), mapper.readTree(afterVerify),
+                "重放核对不得污染链路聚合状态");
+        log.info("重放核对后链路聚合状态未受影响");
     }
 }

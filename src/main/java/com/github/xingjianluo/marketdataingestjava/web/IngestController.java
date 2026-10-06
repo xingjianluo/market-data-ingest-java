@@ -5,6 +5,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.xingjianluo.marketdataingestjava.model.AggregateView;
 import com.github.xingjianluo.marketdataingestjava.model.IngestResult;
 import com.github.xingjianluo.marketdataingestjava.pipeline.IngestPipeline;
+import com.github.xingjianluo.marketdataingestjava.replay.ReplayReport;
+import com.github.xingjianluo.marketdataingestjava.replay.ReplayVerifier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -69,6 +71,19 @@ public class IngestController {
     public String snapshot() {
         pipeline.snapshot();
         return "ok";
+    }
+
+    /**
+     * 在运行中的链路上发起整体重放核对：把已收下的全部历史事件（摄取流水账）
+     * 从一套与当前内存完全无关的空白状态完整重放，逐条比对首次结论，
+     * 返回统计（总数/一致/不一致）与不一致明细。
+     * 核对只读流水账、不触碰链路状态，可随时、可并发发起。
+     */
+    @PostMapping("/replay-verify")
+    public ReplayReport replayVerify() {
+        ReplayReport report = ReplayVerifier.forPipeline(pipeline).verify(pipeline.journal());
+        log.info("[重放核对] HTTP 发起完成: {}", report.summary());
+        return report;
     }
 
     @PostMapping("/restore")
