@@ -93,5 +93,39 @@ class IngestApiIntegrationTest {
         assertEquals(mapper.readTree(before), mapper.readTree(after),
                 "恢复前后聚合必须一致");
         log.info("快照-恢复后端到端聚合一致");
+
+        // 运行中的链路上直接发起整体重放核对：干净起点 -> VERIFIED + 统计
+        String verifyResp = mockMvc.perform(post("/ingest/replay/verify"))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString();
+        JsonNode verify = mapper.readTree(verifyResp);
+        log.info("HTTP 整体重放核对: status={} total={} matched={} mismatched={}",
+                verify.get("status").asText(), verify.get("report").get("totalReplayed").asLong(),
+                verify.get("report").get("matched").asLong(),
+                verify.get("report").get("mismatched").asLong());
+        assertEquals("VERIFIED", verify.get("status").asText());
+        assertEquals(6, verify.get("report").get("totalReplayed").asLong());
+        assertEquals(6, verify.get("report").get("matched").asLong());
+        assertEquals(0, verify.get("report").get("mismatched").asLong());
+
+        // 续处理位置靠后（跳跃）-> 明确拒绝，结论与 VERIFIED 一眼可分
+        String rejectResp = mockMvc.perform(post("/ingest/replay/verify")
+                        .contentType("application/json")
+                        .content("{\"resumeFromPosition\": 2}"))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString();
+        JsonNode rejected = mapper.readTree(rejectResp);
+        log.info("HTTP 核对续处理位置非法: status={} reason={}",
+                rejected.get("status").asText(), rejected.get("reason").asText());
+        assertEquals("REJECTED_OFFSET_REGRESSION", rejected.get("status").asText());
+        assertEquals(true, rejected.get("report").isNull());
+        org.junit.jupiter.api.Assertions.assertTrue(
+                rejected.get("reason").asText().contains("gap refused"));
+
+        // 核对（含被拒绝的）不得污染链路状态
+        String afterVerify = mockMvc.perform(get("/ingest/aggregates"))
+                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
+        assertEquals(mapper.readTree(after), mapper.readTree(afterVerify),
+                "整体重放核对不得改变链路聚合状态");
     }
 }

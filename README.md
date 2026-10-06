@@ -14,7 +14,7 @@
 # 编译
 mvn -o compile
 
-# 全部测试（离线可跑，26 个用例覆盖多源幂等、并发重复、乱序迟到、极端并列、重放恢复与整体重放核对）
+# 全部测试（离线可跑，29 个用例覆盖多源幂等、并发重复、乱序迟到、极端并列、重放恢复与整体重放核对）
 mvn -o test
 
 # 启动本地 HTTP 服务（默认 8080）
@@ -72,7 +72,7 @@ mvn spring-boot:run
 
 | 字段 | 必填 | 类型 | 约束/说明 |
 | --- | --- | --- | --- |
-| `eventId` | 是 | string | 全局幂等键，去重依据 |
+| `eventId` | 是 | string | **来源内**幂等键：各来源各自独立编号（各自从 1 号/0 号开始），跨源同号是彼此独立的事件、不算重复；去重键为 `(source, eventId)` |
 | `source` | 是 | string | 行情来源；位点与水位按来源独立维护 |
 | `symbol` | 是 | string | 标的代码 |
 | `type` | 是 | string | `TRADE` / `QUOTE`，其它取值非法 |
@@ -169,15 +169,29 @@ mvn spring-boot:run
 
 链路在处理每条报文时，会把**完整输入（原始 JSON + 续处理期望位点）与首次结论**
 按实际处理顺序写入摄取流水账（`IngestPipeline.journal()`，含被拒绝的报文）。
-基于流水账可以做整体重放核对：
+基于流水账可以做整体重放核对。
+
+### 在运行中的链路上发起
+
+链路不停机即可发起，两种入口等价：
+
+```bash
+# HTTP：请求体可省略；也可显式给出续处理位置 {"resumeFromPosition": 0}
+curl -s -XPOST localhost:8080/ingest/replay/verify
+```
 
 ```java
-ReplayReport report = ReplayVerifier.forPipeline(pipeline).verify(pipeline.journal());
-// report.totalReplayed()  一共重放多少条
-// report.matched()        多少条结论一致
-// report.mismatched()     多少条结论不一致
-// report.mismatches()     不一致明细：哪一条（流水账序号+eventId）、期望什么、实际什么
+// Java：对运行中的管道直接调用（内部先取流水账一致快照，再在锁外核对）
+ReplayVerificationResult result = pipeline.verifyReplay(null);   // null = 干净起点
+// result.status()  VERIFIED / REJECTED_OFFSET_REGRESSION
+// result.report()  totalReplayed 一共重放多少条
+//                  matched      多少条结论一致
+//                  mismatched   多少条结论不一致
+//                  mismatches   不一致明细：哪一条（流水账序号+eventId）、期望什么、实际什么
 ```
+
+底层核对器也可独立使用：`ReplayVerifier.forPipeline(pipeline).verify(pipeline.journal())`
+直接返回 `ReplayReport`（不做续处理位置校验）。
 
 核对语义与约束：
 
@@ -189,9 +203,28 @@ ReplayReport report = ReplayVerifier.forPipeline(pipeline).verify(pipeline.journ
   全部判定都是该输入序列的确定性函数，因此健康链路的报告必然 `matched == total`。
 - **逐字段比对**：`status` + `reason` + 判定时水位 + 判定时已提交位点，
   任一字段漂移都计为不一致并给出明细。
-- **续处理位置强校验**：核对之外，`resumeIngest` 的期望位点比已提交位点
-  靠前（回退）或靠后（跳跃）都会被 `REJECTED_OFFSET_REGRESSION` 明确拒绝，
-  不会从中间悄悄接上去；这些拒绝结论本身也会入账、可被重放复现。
+- **不污染链路**：核对只读流水账快照、全部计算在锁外的新组件上进行，
+  不推进链路的水位/位点/聚合/流水账；同一批历史事件重放多少遍、
+  多少请求同时发起，逐条结论与统计都完全一致。
+
+### 续处理位置的拒绝口径
+
+发起核对可携带 `resumeFromPosition`（“从哪里接着处理”的流水账位置）。
+核对只允许从**干净起点**（`0`，一条都还没处理过的位置；缺省等同）发起：
+
+- 位置比干净起点**靠前**（回退）→ 拒绝，reason 含 `regression refused`；
+- 位置比干净起点**靠后**（跳跃，从中间接上去会漏计前面的历史事件）→ 拒绝，
+  reason 含 `gap refused`；
+- 两种拒绝的 `status` 都是 **`REJECTED_OFFSET_REGRESSION`**，`report` 为 null、
+  一条都不会重放，绝不会悄悄从中间接上去继续算；
+  该结论与“核对通过（`VERIFIED`）、重复（`DUPLICATE`）、其它拒绝
+  （`REJECTED_INVALID` / `REJECTED_LATE`）”在 status 上一眼可分。
+
+### 续处理位点强校验（摄取侧）
+
+核对之外，`resumeIngest` 的期望位点比已提交位点
+靠前（回退）或靠后（跳跃）都会被 `REJECTED_OFFSET_REGRESSION` 明确拒绝，
+不会从中间悄悄接上去；这些拒绝结论本身也会入账、可被重放复现。
 
 ---
 
@@ -203,6 +236,7 @@ ReplayReport report = ReplayVerifier.forPipeline(pipeline).verify(pipeline.journ
 | `GET  /ingest/aggregates` | 查询全部聚合桶（按 symbol/currency/bucketStart 排序）。 |
 | `POST /ingest/snapshot` | 持久化快照到本地文件。 |
 | `POST /ingest/restore` | 从本地文件恢复状态。 |
+| `POST /ingest/replay/verify` | 整体重放核对：body 可省略，或 `{"resumeFromPosition": 0}`（仅允许干净起点 0，其它位置返回 `REJECTED_OFFSET_REGRESSION`）。返回 `{"status":"VERIFIED","report":{"totalReplayed":N,"matched":N,"mismatched":N,"mismatches":[...]}}`。 |
 
 快速验证（启动服务后）：
 
@@ -216,13 +250,20 @@ curl -s -XPOST localhost:8080/ingest/events -H 'Content-Type: application/json' 
 # 第一条 ACCEPTED，第二条 DUPLICATE
 curl -s localhost:8080/ingest/aggregates
 curl -s -XPOST localhost:8080/ingest/snapshot
+
+# 整体重放核对：VERIFIED 且 matched == totalReplayed 即链路健康
+curl -s -XPOST localhost:8080/ingest/replay/verify
+# 续处理位置非法（跳跃）会被明确拒绝：
+curl -s -XPOST localhost:8080/ingest/replay/verify -H 'Content-Type: application/json' \
+  -d '{"resumeFromPosition": 2}'
+# -> {"status":"REJECTED_OFFSET_REGRESSION","reason":"offset gap refused: ...","report":null}
 ```
 
 ---
 
 ## 7. 验证方法（测试一览）
 
-`mvn -o test`，共 26 个用例。测试日志会打印关键事件、处理位点（`committed`/`watermark`）
+`mvn -o test`，共 29 个用例。测试日志会打印关键事件、处理位点（`committed`/`watermark`）
 与判定依据（`[判定] ACCEPTED/DUPLICATE/LATE/...`、`[跨源独立事件]`、`[快照]`、`[恢复]`、
 `[重放核对]`），每个测试类对应一个业务场景，surefire 汇总可见各类用例数与通过情况。
 
@@ -231,12 +272,12 @@ curl -s -XPOST localhost:8080/ingest/snapshot
 | `ClassificationTest` | 4 | 重复、窗口内乱序并入、窗口边界、超期迟到、缺字段/类型错误、位点回退五类结论可区分 |
 | `MultiSourceIdempotencyTest` | 3 | 多源同号（含同时刻）各自独立计入、同源重发判重且两类结论可区分、位点按源独立、并发重复投递下每个 (source,eventId) 恰好计入一次 |
 | `ExtremeTieOrderIndependenceTest` | 3 | 同时刻+同号跨源并列下 open/close 按 (eventTime,source,eventId) 全序取舍且理由可解释；20 次随机打乱逐字段一致；4 源并发抢投 10 轮与串行一致 |
-| `ReplayVerificationTest` | 4 | 干净状态整体重放逐条比对（总数/一致/不一致统计）、干净起点不继承内存状态、篡改结论后核对器给出明细、续处理位点靠前/靠后均拒绝且拒绝结论可重放复现 |
+| `ReplayVerificationTest` | 7 | 干净状态整体重放逐条比对（总数/一致/不一致统计）、干净起点不继承内存状态、篡改结论后核对器给出明细、续处理位点靠前/靠后均拒绝且拒绝结论可重放复现、运行中链路直接发起核对、核对发起位置靠前/靠后均明确拒绝且结论可区分、8 线程并发核对结果逐字段一致且不污染链路状态 |
 | `SchemaEvolutionTest` | 4 | v1 稳定缺省、v1/v2 同桶、币种分桶、新字段类型错误不静默、缺省常量稳定 |
 | `OrderIndependenceTest` | 1 | 多种到达排列（含乱序）产生逐字段一致的 OHLC |
 | `ConcurrencyTest` | 2 | 8 线程重复投递每 eventId 恰好计入一次；两次并发运行结果完全一致 |
 | `RecoveryReplayTest` | 3 | 快照→重建→继续处理不重不漏；旧位点重放拒绝；无快照空启动 |
-| `IngestApiIntegrationTest` | 1 | HTTP 端到端：批量分类、聚合查询、快照落本地文件、恢复后一致 |
+| `IngestApiIntegrationTest` | 1 | HTTP 端到端：批量分类、聚合查询、快照落本地文件、恢复后一致、运行中发起整体重放核对（VERIFIED 统计 + 非法续处理位置拒绝）且核对不污染链路 |
 | `ApplicationTests` | 1 | Spring 上下文装配 |
 
 并发模型说明：**多源可并发**（每源独立水位/位点/锁内串行判定），
@@ -258,7 +299,8 @@ state/        PipelineState / SnapshotRepository / FileSnapshotRepository（本�
               / InMemorySnapshotRepository（重放核对的干净起点）
 replay/       RecordedIngestion（摄取流水账）/ ReplayVerifier（干净状态整体重放核对）
               / ReplayReport / ReplayMismatch（统计与不一致明细）
-pipeline/     IngestPipeline（判定顺序、并发控制、流水账、快照/恢复、重放）
-web/          IngestController / EventRequest（本地 HTTP 入口）
+              / ReplayVerificationResult / ReplayVerificationStatus（核对发起结论：VERIFIED 或拒绝）
+pipeline/     IngestPipeline（判定顺序、并发控制、流水账、快照/恢复、重放、verifyReplay 核对入口）
+web/          IngestController / EventRequest / ReplayVerifyRequest（本地 HTTP 入口）
 config/       IngestProperties / IngestConfig（装配与参数）
 ```

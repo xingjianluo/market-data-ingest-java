@@ -5,6 +5,8 @@ import com.github.xingjianluo.marketdataingestjava.model.IngestStatus;
 import com.github.xingjianluo.marketdataingestjava.pipeline.IngestPipeline;
 import com.github.xingjianluo.marketdataingestjava.replay.RecordedIngestion;
 import com.github.xingjianluo.marketdataingestjava.replay.ReplayReport;
+import com.github.xingjianluo.marketdataingestjava.replay.ReplayVerificationResult;
+import com.github.xingjianluo.marketdataingestjava.replay.ReplayVerificationStatus;
 import com.github.xingjianluo.marketdataingestjava.replay.ReplayVerifier;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -14,8 +16,15 @@ import org.slf4j.LoggerFactory;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -148,5 +157,98 @@ class ReplayVerificationTest extends PipelineTest {
         log.info("含位点拒绝的流水重放: {}", report.summary());
         assertTrue(report.allMatched());
         assertEquals(6, report.totalReplayed());
+    }
+
+    @Test
+    @DisplayName("运行中的链路可直接发起核对：verifyReplay 从干净起点给出统计与明细")
+    void pipelineVerifyReplayFromCleanStart() {
+        var p = runMixedBatch();
+
+        ReplayVerificationResult result = p.verifyReplay(null);
+        log.info("verifyReplay(缺省位置) -> {} {}", result.status(), result.report().summary());
+        assertEquals(ReplayVerificationStatus.VERIFIED, result.status());
+        assertTrue(result.verifiedOk());
+        assertEquals(8, result.report().totalReplayed());
+        assertEquals(8, result.report().matched());
+        assertEquals(0, result.report().mismatched());
+        assertTrue(result.report().mismatches().isEmpty());
+
+        // 显式给出干净起点（0，一条都还没处理过的位置）同样允许
+        ReplayVerificationResult explicit = p.verifyReplay(0L);
+        log.info("verifyReplay(干净起点 0) -> {} {}", explicit.status(), explicit.report().summary());
+        assertEquals(ReplayVerificationStatus.VERIFIED, explicit.status());
+        assertEquals(result.report(), explicit.report(), "同一批历史事件重放多少遍统计都必须一致");
+    }
+
+    @Test
+    @DisplayName("核对发起的续处理位置：比干净起点靠前或靠后都明确拒绝，结论与正常核对可区分")
+    void verifyReplayRejectsNonCleanStartPositions() {
+        var p = runMixedBatch();
+
+        // 靠前（回退）：从干净起点之前的位置发起 -> 拒绝
+        ReplayVerificationResult behind = p.verifyReplay(-1L);
+        log.info("核对续处理位置靠前 -> {} reason='{}'", behind.status(), behind.reason());
+        assertEquals(ReplayVerificationStatus.REJECTED_OFFSET_REGRESSION, behind.status());
+        assertTrue(behind.reason().contains("regression refused"));
+        assertNull(behind.report(), "被拒绝的核对一条都不允许重放");
+
+        // 靠后（跳跃）：从中间接上去会漏计 -> 拒绝
+        ReplayVerificationResult ahead = p.verifyReplay(3L);
+        log.info("核对续处理位置靠后 -> {} reason='{}'", ahead.status(), ahead.reason());
+        assertEquals(ReplayVerificationStatus.REJECTED_OFFSET_REGRESSION, ahead.status());
+        assertTrue(ahead.reason().contains("gap refused"));
+        assertNull(ahead.report());
+
+        // 拒绝结论与“核对通过”一眼可分（独立状态枚举，不与摄取结论混淆）
+        assertNotEquals(ReplayVerificationStatus.VERIFIED, behind.status());
+        assertNotEquals(ReplayVerificationStatus.VERIFIED, ahead.status());
+
+        // 拒绝不触碰链路状态、不产生任何重放副作用
+        assertEquals(2, p.committedOffset("src-A"));
+        assertEquals(8, p.journal().size());
+    }
+
+    @Test
+    @DisplayName("并发发起核对：多线程同时 verifyReplay 统计逐字段一致，且互不污染、不影响链路状态")
+    void concurrentVerifyReplayConsistentAndNonPolluting() throws Exception {
+        var p = runMixedBatch();
+        long committedBefore = p.committedOffset("src-A");
+        int journalBefore = p.journal().size();
+        var aggregatesBefore = p.aggregates();
+
+        int threads = 8;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        CountDownLatch start = new CountDownLatch(1);
+        List<Future<ReplayVerificationResult>> futures = new ArrayList<>();
+        for (int i = 0; i < threads; i++) {
+            futures.add(pool.submit(() -> {
+                start.await();
+                return p.verifyReplay(null);
+            }));
+        }
+        start.countDown();
+        pool.shutdown();
+        assertTrue(pool.awaitTermination(30, TimeUnit.SECONDS));
+
+        List<ReplayVerificationResult> results = new ArrayList<>();
+        for (Future<ReplayVerificationResult> f : futures) {
+            results.add(f.get());
+        }
+        ReplayReport first = results.get(0).report();
+        for (ReplayVerificationResult r : results) {
+            assertEquals(ReplayVerificationStatus.VERIFIED, r.status());
+            assertEquals(8, r.report().totalReplayed());
+            assertEquals(8, r.report().matched());
+            assertTrue(r.report().allMatched());
+            assertEquals(first, r.report(), "并发核对报告必须逐字段一致");
+        }
+        log.info("并发 {} 路核对全部一致: {}", threads, first.summary());
+
+        // 核对过程不得反过来影响链路本身的状态
+        assertEquals(committedBefore, p.committedOffset("src-A"));
+        assertEquals(journalBefore, p.journal().size());
+        assertEquals(aggregatesBefore, p.aggregates());
+        log.info("核对后链路状态未变: committed={} journal={} buckets={}",
+                committedBefore, journalBefore, aggregatesBefore.size());
     }
 }

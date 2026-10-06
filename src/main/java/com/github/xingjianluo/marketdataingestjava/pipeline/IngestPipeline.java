@@ -10,6 +10,8 @@ import com.github.xingjianluo.marketdataingestjava.model.IngestResult;
 import com.github.xingjianluo.marketdataingestjava.model.IngestStatus;
 import com.github.xingjianluo.marketdataingestjava.model.MarketEvent;
 import com.github.xingjianluo.marketdataingestjava.replay.RecordedIngestion;
+import com.github.xingjianluo.marketdataingestjava.replay.ReplayVerificationResult;
+import com.github.xingjianluo.marketdataingestjava.replay.ReplayVerifier;
 import com.github.xingjianluo.marketdataingestjava.state.PipelineState;
 import com.github.xingjianluo.marketdataingestjava.state.SnapshotRepository;
 import com.github.xingjianluo.marketdataingestjava.window.WatermarkManager;
@@ -196,6 +198,24 @@ public class IngestPipeline {
         synchronized (journal) {
             return List.copyOf(journal);
         }
+    }
+
+    /**
+     * 在运行中的链路上发起整体重放核对：先取流水账的一致快照（只读拷贝），
+     * 再从与该管道完全无关的空白状态整体重放，逐条比对首次结论。
+     *
+     * <p>约束：
+     * <ul>
+     *   <li>核对在锁外进行，只读流水账快照，绝不触碰、也不污染本管道的任何状态；</li>
+     *   <li>每次核对都新建一整套组件，与当前内存进度无关，可并发发起、结果一致；</li>
+     *   <li>{@code resumeFromPosition} 为发起方要求“从哪里接着处理”的流水账位置，
+     *       只允许干净起点（缺省或 0）；靠前（回退）或靠后（跳跃漏计）都明确拒绝，
+     *       拒绝结论为 {@code REJECTED_OFFSET_REGRESSION}，与核对通过/重复/其它拒绝可区分。</li>
+     * </ul>
+     */
+    public ReplayVerificationResult verifyReplay(Long resumeFromPosition) {
+        List<RecordedIngestion> snapshot = journal();
+        return ReplayVerifier.forPipeline(this).verify(snapshot, resumeFromPosition);
     }
 
     /** 原子持久化当前全量状态（先在锁内取一致快照，IO 在锁外执行）。 */

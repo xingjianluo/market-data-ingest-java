@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.xingjianluo.marketdataingestjava.model.AggregateView;
 import com.github.xingjianluo.marketdataingestjava.model.IngestResult;
 import com.github.xingjianluo.marketdataingestjava.pipeline.IngestPipeline;
+import com.github.xingjianluo.marketdataingestjava.replay.ReplayVerificationResult;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -75,6 +76,22 @@ public class IngestController {
     public String restore() {
         pipeline.restore();
         return "ok";
+    }
+
+    /**
+     * 在运行中的链路上发起整体重放核对：从干净空白状态重放已收下的全部历史事件，
+     * 逐条比对首次结论，返回 总数/一致/不一致 统计与不一致明细。
+     * 请求体可省略；携带 resumeFromPosition 时仅允许干净起点（0），
+     * 靠前（回退）或靠后（跳跃）都会得到 REJECTED_OFFSET_REGRESSION 的明确拒绝。
+     */
+    @PostMapping("/replay/verify")
+    public ReplayVerificationResult verifyReplay(
+            @RequestBody(required = false) ReplayVerifyRequest request) {
+        Long resumeFromPosition = request == null ? null : request.getResumeFromPosition();
+        ReplayVerificationResult result = pipeline.verifyReplay(resumeFromPosition);
+        log.info("[入口] 整体重放核对发起: status={} {}", result.status(),
+                result.report() != null ? result.report().summary() : "reason='" + result.reason() + "'");
+        return result;
     }
 
     private String peekSource(String raw) {
